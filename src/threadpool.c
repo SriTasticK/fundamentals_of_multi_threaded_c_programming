@@ -1,4 +1,4 @@
-#include "threadpool.h"
+#include "../inc/threadpool.h"
 #include <stdlib.h>
 
 static void* thread_function(void* arg) {
