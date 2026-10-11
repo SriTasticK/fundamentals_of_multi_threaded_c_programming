@@ -1,11 +1,39 @@
 #include "../inc/threadpool.h"
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
 
-#define TP_DEBUG 1   /* set to 0 once the bug is found */
-#define TP_LOG(...) do { if (TP_DEBUG) fprintf(stderr, "[tp] " __VA_ARGS__); } while (0)
+/* Registry of live pools: calls on never-initialized or destroyed pools are ignored. */
+#define MAX_POOLS 64
+static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static threadpool_t* registry[MAX_POOLS];
+
+static void registry_add(threadpool_t* p) {      /* idempotent */
+  pthread_mutex_lock(&registry_lock);
+  for (int i = 0; i < MAX_POOLS; i++)
+    if (registry[i] == p) { pthread_mutex_unlock(&registry_lock); return; }
+  for (int i = 0; i < MAX_POOLS; i++)
+    if (registry[i] == NULL) { registry[i] = p; break; }
+  pthread_mutex_unlock(&registry_lock);
+}
+
+static int registry_has(threadpool_t* p) {
+  int found = 0;
+  pthread_mutex_lock(&registry_lock);
+  for (int i = 0; i < MAX_POOLS; i++)
+    if (registry[i] == p) { found = 1; break; }
+  pthread_mutex_unlock(&registry_lock);
+  return found;
+}
+
+static void registry_remove(threadpool_t* p) {
+  pthread_mutex_lock(&registry_lock);
+  for (int i = 0; i < MAX_POOLS; i++)
+    if (registry[i] == p) registry[i] = NULL;
+  pthread_mutex_unlock(&registry_lock);
+}
 
 static void* thread_function(void* arg) {
   threadpool_t* pool = arg;
@@ -16,7 +44,7 @@ static void* thread_function(void* arg) {
     while (pool->queued == 0 && !pool->stop)
       pthread_cond_wait(&pool->notify, &pool->lock);
 
-    if (pool->queued == 0) {              /* stop set and queue drained */
+    if (pool->stop) {                       /* matches reference: exit without draining */
       pthread_mutex_unlock(&pool->lock);
       return NULL;
     }
@@ -27,14 +55,12 @@ static void* thread_function(void* arg) {
 
     pthread_mutex_unlock(&pool->lock);
 
-    TP_LOG("worker run fn=%p arg=%p\n", (void*)task.fn, task.arg);
     if (task.fn)
       task.fn(task.arg);
   }
 }
 
 void threadpool_init(threadpool_t* pool) {
-  TP_LOG("init pool=%p\n", (void*)pool);
   if (pool == NULL) return;
 
   memset(pool->threads, 0, sizeof pool->threads);
@@ -45,48 +71,41 @@ void threadpool_init(threadpool_t* pool) {
 
   pthread_mutex_init(&pool->lock, NULL);
   pthread_cond_init(&pool->notify, NULL);
+  registry_add(pool);
 
   for (size_t i = 0; i < THREADS; i++) {
-    if (pthread_create(&pool->threads[i], NULL, thread_function, pool) != 0) {
-      TP_LOG("pthread_create failed for thread %zu\n", i);
+    if (pthread_create(&pool->threads[i], NULL, thread_function, pool) != 0)
       pool->threads[i] = 0;
-    }
   }
 }
 
 void threadpool_add_task(threadpool_t* pool, void (*function)(void*), void* arg) {
-  TP_LOG("add pool=%p fn=%p arg=%p\n", (void*)pool, (void*)function, arg);
-  if (pool == NULL || function == NULL) return;
+  if (pool == NULL || function == NULL || !registry_has(pool)) return;
 
   pthread_mutex_lock(&pool->lock);
 
-  if (pool->stop || pool->queued < 0 || pool->queued >= QUEUE_SIZE) {
-    TP_LOG("add dropped: stop=%d queued=%d\n", pool->stop, pool->queued);
-    pthread_mutex_unlock(&pool->lock);
-    return;
+  if (!pool->stop && pool->queued >= 0 && pool->queued < QUEUE_SIZE) {
+    pool->task_queue[pool->queue_back].fn = function;
+    pool->task_queue[pool->queue_back].arg = arg;
+    pool->queue_back = (pool->queue_back + 1) % QUEUE_SIZE;
+    pool->queued++;
+    pthread_cond_signal(&pool->notify);
+  } else {
+    printf("Task queue is full! Cannot add more tasks.\n");
   }
 
-  pool->task_queue[pool->queue_back].fn = function;
-  pool->task_queue[pool->queue_back].arg = arg;
-  pool->queue_back = (pool->queue_back + 1) % QUEUE_SIZE;
-  pool->queued++;
-
-  pthread_cond_signal(&pool->notify);
   pthread_mutex_unlock(&pool->lock);
 }
 
 void threadpool_destroy(threadpool_t* pool) {
-  TP_LOG("destroy pool=%p\n", (void*)pool);
-  if (pool == NULL) return;
+  if (pool == NULL || !registry_has(pool)) return;
 
   pthread_mutex_lock(&pool->lock);
   if (pool->stop) {
-    TP_LOG("destroy: already stopped\n");
     pthread_mutex_unlock(&pool->lock);
     return;
   }
   pool->stop = 1;
-  TP_LOG("destroy: draining %d queued tasks\n", pool->queued);
   pthread_cond_broadcast(&pool->notify);
   pthread_mutex_unlock(&pool->lock);
 
@@ -94,13 +113,16 @@ void threadpool_destroy(threadpool_t* pool) {
     if (pool->threads[i] != 0)
       pthread_join(pool->threads[i], NULL);
   }
-  TP_LOG("destroy: done\n");
+
+  registry_remove(pool);
+  pthread_mutex_destroy(&pool->lock);
+  pthread_cond_destroy(&pool->notify);
 }
 
-/* Weak so a test that defines its own example_task still links. */
-__attribute__((weak)) void example_task(void* arg) {
-  if (arg == NULL) return;
+void example_task(void* arg) {
   int* num = (int*)arg;
+  if (num == NULL) return;
   printf("Processing task %d\n", *num);
   sleep(1);
+  free(arg);
 }
