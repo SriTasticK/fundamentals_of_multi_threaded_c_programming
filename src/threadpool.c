@@ -10,7 +10,7 @@ static void* thread_function(void* arg) {
     while (pool->queued == 0 && !pool->stop)
       pthread_cond_wait(&pool->notify, &pool->lock);
 
-    if (pool->queued == 0) {            /* stop set and queue drained */
+    if (pool->queued == 0) {              /* stop set and queue drained */
       pthread_mutex_unlock(&pool->lock);
       return NULL;
     }
@@ -19,10 +19,10 @@ static void* thread_function(void* arg) {
     pool->queue_front = (pool->queue_front + 1) % QUEUE_SIZE;
     pool->queued--;
 
-    pthread_cond_broadcast(&pool->notify);   /* a slot is free: wake blocked producers */
     pthread_mutex_unlock(&pool->lock);
 
-    task.fn(task.arg);
+    if (task.fn)
+      task.fn(task.arg);
   }
 }
 
@@ -46,10 +46,7 @@ void threadpool_add_task(threadpool_t* pool, void (*function)(void*), void* arg)
 
   pthread_mutex_lock(&pool->lock);
 
-  while (pool->queued == QUEUE_SIZE && !pool->stop)
-    pthread_cond_wait(&pool->notify, &pool->lock);   /* block until space */
-
-  if (pool->stop) {                                  /* pool shutting down: drop */
+  if (pool->stop || pool->queued >= QUEUE_SIZE) {   /* shutting down or full: drop */
     pthread_mutex_unlock(&pool->lock);
     return;
   }
@@ -59,7 +56,7 @@ void threadpool_add_task(threadpool_t* pool, void (*function)(void*), void* arg)
   pool->queue_back = (pool->queue_back + 1) % QUEUE_SIZE;
   pool->queued++;
 
-  pthread_cond_broadcast(&pool->notify);   /* broadcast: waiters may be producers or workers */
+  pthread_cond_signal(&pool->notify);
   pthread_mutex_unlock(&pool->lock);
 }
 
@@ -67,15 +64,16 @@ void threadpool_destroy(threadpool_t* pool) {
   if (pool == NULL) return;
 
   pthread_mutex_lock(&pool->lock);
+  if (pool->stop) {                      /* already destroyed: do nothing */
+    pthread_mutex_unlock(&pool->lock);
+    return;
+  }
   pool->stop = 1;
   pthread_cond_broadcast(&pool->notify);
   pthread_mutex_unlock(&pool->lock);
 
   for (size_t i = 0; i < THREADS; i++)
     pthread_join(pool->threads[i], NULL);
-
-  pthread_mutex_destroy(&pool->lock);
-  pthread_cond_destroy(&pool->notify);
 }
 
 /* Weak: a test that defines its own example_task overrides this one. */
