@@ -1,0 +1,15 @@
+# Build outputs
+*.o
+*.obj
+*.a
+*.so
+*.out
+build/
+bin/
+
+# Debug / sanitizer / profiling artifacts
+*.dSYM/
+core
+vgcore.*
+*.gcda
+*.gcno
