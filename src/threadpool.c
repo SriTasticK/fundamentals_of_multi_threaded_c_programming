@@ -1,5 +1,6 @@
 #include "../inc/threadpool.h"
 #include <stddef.h>
+#include <string.h>
 
 static void* thread_function(void* arg) {
   threadpool_t* pool = arg;
@@ -29,6 +30,7 @@ static void* thread_function(void* arg) {
 void threadpool_init(threadpool_t* pool) {
   if (pool == NULL) return;
 
+  memset(pool->threads, 0, sizeof pool->threads);   /* so destroy can tell which exist */
   pool->queued = 0;
   pool->queue_front = 0;
   pool->queue_back = 0;
@@ -37,8 +39,10 @@ void threadpool_init(threadpool_t* pool) {
   pthread_mutex_init(&pool->lock, NULL);
   pthread_cond_init(&pool->notify, NULL);
 
-  for (size_t i = 0; i < THREADS; i++)
-    pthread_create(&pool->threads[i], NULL, thread_function, pool);
+  for (size_t i = 0; i < THREADS; i++) {
+    if (pthread_create(&pool->threads[i], NULL, thread_function, pool) != 0)
+      pool->threads[i] = 0;                         /* creation failed: never join it */
+  }
 }
 
 void threadpool_add_task(threadpool_t* pool, void (*function)(void*), void* arg) {
@@ -46,8 +50,8 @@ void threadpool_add_task(threadpool_t* pool, void (*function)(void*), void* arg)
 
   pthread_mutex_lock(&pool->lock);
 
-  if (pool->stop || pool->queued >= QUEUE_SIZE) {   /* shutting down or full: drop */
-    pthread_mutex_unlock(&pool->lock);
+  if (pool->stop || pool->queued < 0 || pool->queued >= QUEUE_SIZE) {
+    pthread_mutex_unlock(&pool->lock);              /* shutting down or full: drop */
     return;
   }
 
@@ -64,7 +68,7 @@ void threadpool_destroy(threadpool_t* pool) {
   if (pool == NULL) return;
 
   pthread_mutex_lock(&pool->lock);
-  if (pool->stop) {                      /* already destroyed: do nothing */
+  if (pool->stop) {                                 /* already destroyed */
     pthread_mutex_unlock(&pool->lock);
     return;
   }
@@ -72,11 +76,12 @@ void threadpool_destroy(threadpool_t* pool) {
   pthread_cond_broadcast(&pool->notify);
   pthread_mutex_unlock(&pool->lock);
 
-  for (size_t i = 0; i < THREADS; i++)
-    pthread_join(pool->threads[i], NULL);
+  for (size_t i = 0; i < THREADS; i++) {
+    if (pool->threads[i] != 0)                      /* skip never-created threads */
+      pthread_join(pool->threads[i], NULL);
+  }
 }
 
-/* Weak: a test that defines its own example_task overrides this one. */
 __attribute__((weak)) void example_task(void* arg) {
   (void)arg;
 }
