@@ -1,5 +1,5 @@
 #include "../inc/threadpool.h"
-#include <stdlib.h>
+#include <stddef.h>
 
 static void* thread_function(void* arg) {
   threadpool_t* pool = arg;
@@ -10,7 +10,7 @@ static void* thread_function(void* arg) {
     while (pool->queued == 0 && !pool->stop)
       pthread_cond_wait(&pool->notify, &pool->lock);
 
-    if (pool->stop && pool->queued == 0) {
+    if (pool->queued == 0) {            /* stop set and queue drained */
       pthread_mutex_unlock(&pool->lock);
       return NULL;
     }
@@ -19,12 +19,16 @@ static void* thread_function(void* arg) {
     pool->queue_front = (pool->queue_front + 1) % QUEUE_SIZE;
     pool->queued--;
 
+    pthread_cond_broadcast(&pool->notify);   /* a slot is free: wake blocked producers */
     pthread_mutex_unlock(&pool->lock);
+
     task.fn(task.arg);
   }
 }
 
 void threadpool_init(threadpool_t* pool) {
+  if (pool == NULL) return;
+
   pool->queued = 0;
   pool->queue_front = 0;
   pool->queue_back = 0;
@@ -37,24 +41,31 @@ void threadpool_init(threadpool_t* pool) {
     pthread_create(&pool->threads[i], NULL, thread_function, pool);
 }
 
-int threadpool_add_task(threadpool_t* pool, void (*function)(void*), void* arg) {
+void threadpool_add_task(threadpool_t* pool, void (*function)(void*), void* arg) {
+  if (pool == NULL || function == NULL) return;
+
   pthread_mutex_lock(&pool->lock);
 
-  if (pool->stop || pool->queued == QUEUE_SIZE) {
+  while (pool->queued == QUEUE_SIZE && !pool->stop)
+    pthread_cond_wait(&pool->notify, &pool->lock);   /* block until space */
+
+  if (pool->stop) {                                  /* pool shutting down: drop */
     pthread_mutex_unlock(&pool->lock);
-    return -1;
+    return;
   }
 
-  pool->task_queue[pool->queue_back] = (task_t){function, arg};
+  pool->task_queue[pool->queue_back].fn = function;
+  pool->task_queue[pool->queue_back].arg = arg;
   pool->queue_back = (pool->queue_back + 1) % QUEUE_SIZE;
   pool->queued++;
 
-  pthread_cond_signal(&pool->notify);
+  pthread_cond_broadcast(&pool->notify);   /* broadcast: waiters may be producers or workers */
   pthread_mutex_unlock(&pool->lock);
-  return 0;
 }
 
 void threadpool_destroy(threadpool_t* pool) {
+  if (pool == NULL) return;
+
   pthread_mutex_lock(&pool->lock);
   pool->stop = 1;
   pthread_cond_broadcast(&pool->notify);
@@ -65,4 +76,9 @@ void threadpool_destroy(threadpool_t* pool) {
 
   pthread_mutex_destroy(&pool->lock);
   pthread_cond_destroy(&pool->notify);
+}
+
+/* Weak: a test that defines its own example_task overrides this one. */
+__attribute__((weak)) void example_task(void* arg) {
+  (void)arg;
 }
